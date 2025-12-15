@@ -3,8 +3,7 @@ const express = require('express');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const stripe = require('stripe')(process.env.STRIPE_SCRET_KEY);
-
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); // standardized name
 
 const port = process.env.PORT || 3000;
 
@@ -26,7 +25,7 @@ app.use(cors({
   origin: [
     'http://localhost:5173',
     'http://localhost:5174',
-    'https://b12-m11-session.web.app',
+    process.env.SITE_DOMAIN
   ],
   credentials: true,
   optionSuccessStatus: 200,
@@ -40,21 +39,19 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
+let usersCollection, tuitionsCollection, contactCollection, paymentsCollection;
+
 // --------------------
 // JWT Middleware
 // --------------------
 const verifyJWT = async (req, res, next) => {
   const authHeader = req?.headers?.authorization;
-  console.log("Authorization Header (Bearer <token>):", authHeader);
-
   if (!authHeader) return res.status(401).send({ message: "Unauthorized Access!" });
 
-  const token = authHeader.split(" ")[1]; // extract the token
-
+  const token = authHeader.split(" ")[1];
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.tokenEmail = decoded.email;
-    console.log("Decoded Token:", decoded);
     next();
   } catch (err) {
     if (err.code === "auth/id-token-expired") {
@@ -63,7 +60,6 @@ const verifyJWT = async (req, res, next) => {
     return res.status(401).send({ message: "Unauthorized Access!", err });
   }
 };
-
 
 // --------------------
 // Role Middleware
@@ -83,50 +79,32 @@ const verifyRole = (requiredRole) => async (req, res, next) => {
 // --------------------
 // MongoDB Connection & Routes
 // --------------------
-let usersCollection, tuitionsCollection, contactCollection, paymentsCollection;
-
 async function run() {
   try {
-    console.log('Successfully connected to MongoDB!');
+    await client.connect();
+    console.log('Connected to MongoDB');
 
-    const database = client.db("edumatch");
-    usersCollection = database.collection("users");
-    tuitionsCollection = database.collection("tuitions");
-    contactCollection = database.collection("contacts");
-    paymentsCollection = database.collection("payments");
-
-
-
+    const db = client.db("edumatch");
+    usersCollection = db.collection("users");
+    tuitionsCollection = db.collection("tuitions");
+    contactCollection = db.collection("contacts");
+    paymentsCollection = db.collection("payments");
 
     // ------------------------
-    // Create Stripe Checkout Session
+    // Stripe Checkout Session
     // ------------------------
     app.post("/create-checkout-session", async (req, res) => {
-      console.log("[create-checkout-session] Request body:", req.body);
-
       let { budget, tuitionTitle, studentEmail, tutorEmail, tuitionId } = req.body;
-
       if (!budget || !tuitionTitle || !tutorEmail || !tuitionId) {
-        console.log("[create-checkout-session] Missing required fields");
         return res.status(400).json({ message: "Missing required payment fields" });
       }
 
-      // If studentEmail isn't provided, try to resolve it from the tuition record
+      // Resolve studentEmail if missing
       if (!studentEmail && ObjectId.isValid(tuitionId)) {
-        try {
-          const tuition = await tuitionsCollection.findOne({ _id: new ObjectId(tuitionId) });
-          if (tuition && tuition.studentEmail) {
-            studentEmail = tuition.studentEmail;
-          }
-        } catch (err) {
-          console.warn("[create-checkout-session] Failed to resolve studentEmail from tuitionId", err);
-        }
+        const tuition = await tuitionsCollection.findOne({ _id: new ObjectId(tuitionId) });
+        if (tuition?.studentEmail) studentEmail = tuition.studentEmail;
       }
-
-      if (!studentEmail) {
-        console.log("[create-checkout-session] Missing studentEmail after attempt to resolve from tuitionId");
-        return res.status(400).json({ message: "Missing studentEmail for payment" });
-      }
+      if (!studentEmail) return res.status(400).json({ message: "Missing studentEmail for payment" });
 
       const amount = Math.round(parseFloat(budget) * 100);
       if (isNaN(amount) || !isFinite(amount)) return res.status(400).json({ message: "Invalid budget" });
@@ -134,27 +112,22 @@ async function run() {
       try {
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
-          line_items: [
-            {
-              price_data: {
-                currency: "usd",
-                unit_amount: amount,
-                product_data: { name: tuitionTitle },
-              },
-              quantity: 1,
+          line_items: [{
+            price_data: {
+              currency: "usd",
+              unit_amount: amount,
+              product_data: { name: tuitionTitle },
             },
-          ],
+            quantity: 1,
+          }],
           mode: "payment",
           metadata: { tuitionId, tutorEmail, studentEmail, budget, tuitionTitle },
           customer_email: studentEmail,
           success_url: `${process.env.SITE_DOMAIN}/dashboard/student/payments/success?session_id={CHECKOUT_SESSION_ID}`,
           cancel_url: `${process.env.SITE_DOMAIN}/dashboard/student/payments/cancelled`,
         });
-
-        console.log("[create-checkout-session] Stripe session created:", session.id);
         res.json({ url: session.url });
       } catch (err) {
-        console.error("[create-checkout-session] Stripe error:", err);
         res.status(500).json({ message: err.message });
       }
     });
@@ -164,104 +137,52 @@ async function run() {
     // ------------------------
     app.get("/student/payment/verify", verifyJWT, async (req, res) => {
       const { session_id } = req.query;
-
       if (!session_id) return res.status(400).json({ message: "Session ID is required" });
 
       try {
-        console.log("[verify] Retrieving Stripe session:", session_id, "for user:", req.tokenEmail);
         const session = await stripe.checkout.sessions.retrieve(session_id);
-
-        if (!session) return res.status(404).json({ message: "Stripe session not found" });
-
-        if (session.payment_status !== "paid")
+        if (!session || session.payment_status !== "paid") {
           return res.status(400).json({ message: "Payment not completed" });
-
-        const { tuitionId, studentEmail, tutorEmail, tuitionTitle, budget } = session.metadata || {};
-        if (!tuitionId || !studentEmail || !tutorEmail) {
-          return res.status(400).json({ message: "Required payment metadata missing" });
         }
 
-        // Log when metadata studentEmail doesn't match the authenticated user
-        if ((req.tokenEmail || "").toLowerCase().trim() !== (studentEmail || "").toLowerCase().trim()) {
-          console.warn('[verify] tokenEmail does not match metadata studentEmail', req.tokenEmail, studentEmail);
-        }
+        const { tuitionId, studentEmail, tutorEmail, tuitionTitle, budget } = session.metadata;
+        if (!tuitionId || !studentEmail || !tutorEmail) return res.status(400).json({ message: "Required payment metadata missing" });
 
-        // Find the tuition by the authenticated student to ensure the user owns it
+        // Ensure student owns the tuition
         const tuition = await tuitionsCollection.findOne({ _id: new ObjectId(tuitionId), studentEmail: req.tokenEmail });
         if (!tuition) return res.status(404).json({ message: "Tuition not found" });
 
-        // Build updated applications array with case-insensitive email match
-        const normalizedTutorEmail = (tutorEmail || "").toLowerCase().trim();
-        console.log('[verify] existing applications:', JSON.stringify(tuition.applications));
+        const normalizedTutorEmail = tutorEmail.toLowerCase().trim();
         const updatedApplications = (tuition.applications || []).map(app => {
-          const appEmail = (app?.tutorEmail || "").toLowerCase().trim();
-          const approved = appEmail === normalizedTutorEmail;
-          return { ...app, status: approved ? "Approved" : "Rejected" };
+          return { ...app, status: (app.tutorEmail.toLowerCase().trim() === normalizedTutorEmail ? "Approved" : "Rejected") };
         });
-        console.log('[verify] updated applications:', JSON.stringify(updatedApplications));
 
-        const updateRes = await tuitionsCollection.updateOne(
-          { _id: new ObjectId(tuitionId) },
-          { $set: { applications: updatedApplications } }
-        );
-        console.log('[verify] update result:', updateRes.result || updateRes);
+        await tuitionsCollection.updateOne({ _id: new ObjectId(tuitionId) }, { $set: { applications: updatedApplications } });
 
-        // Record payment in payments collection (avoid duplicates)
-        try {
-          const sessionIdStr = session.id || session_id;
-          const existingPayment = await paymentsCollection.findOne({ sessionId: sessionIdStr });
-          let paymentDoc = null;
-          // Stripe returns amount_total in cents. Convert to dollars for storage by dividing by 100.
-          const amountCents = session.amount_total || (budget ? Math.round(parseFloat(budget) * 100) : null);
-          const amount = amountCents ? (amountCents / 100) : null;
-          if (!existingPayment) {
-            paymentDoc = {
-              sessionId: sessionIdStr,
-              paymentIntent: session.payment_intent || null,
-              paymentIntentId: session.payment_intent || null,
-              tuitionId: new ObjectId(tuitionId),
-              tuitionTitle,
-              studentEmail,
-              tutorEmail,
-              amount: amount,
-              amount_cents: amountCents,
-              currency: session.currency || 'usd',
-              metadata: session.metadata || {},
-              created_at: new Date().toISOString(),
-            };
-            const insertRes = await paymentsCollection.insertOne(paymentDoc);
-            paymentDoc._id = insertRes.insertedId;
-          } else {
-            paymentDoc = existingPayment;
-          }
-
-          return res.json({
-            message: "Payment verified successfully and tutor approved",
-            amount: amount,
+        // Record payment if not exists
+        const existingPayment = await paymentsCollection.findOne({ sessionId: session.id });
+        if (!existingPayment) {
+          const amountCents = session.amount_total || Math.round(parseFloat(budget) * 100);
+          await paymentsCollection.insertOne({
+            sessionId: session.id,
+            paymentIntent: session.payment_intent,
+            tuitionId: new ObjectId(tuitionId),
             tuitionTitle,
+            studentEmail,
             tutorEmail,
-            applications: updatedApplications,
-            payment: paymentDoc,
+            amount: amountCents / 100,
+            amount_cents: amountCents,
+            currency: session.currency || 'usd',
+            metadata: session.metadata,
+            created_at: new Date().toISOString(),
           });
-        } catch (err) {
-          console.error("[verify] Error saving payment record:", err);
         }
 
-        const fallbackAmountCents = session.amount_total || (budget ? Math.round(parseFloat(budget) * 100) : null);
-        const fallbackAmount = fallbackAmountCents ? fallbackAmountCents / 100 : null;
-        res.json({
-          message: "Payment verified successfully and tutor approved",
-          amount: fallbackAmount,
-          tuitionTitle,
-          tutorEmail,
-          applications: updatedApplications
-        });
+        res.json({ message: "Payment verified successfully and tutor approved", applications: updatedApplications });
       } catch (err) {
-        console.error("[verify] Unexpected error:", err);
         res.status(500).json({ message: "Server error verifying payment", error: err.message });
       }
     });
-
     // ------------------------
     // Public debug route (optional)
     // ------------------------
